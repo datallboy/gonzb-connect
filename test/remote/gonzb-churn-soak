@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+duration_seconds=${1:-3600}
+artifact_dir=${2:?artifact directory is required}
+gonzb_root=${3:?GoNZB repository root is required}
+config_dir=${4:?generated traversal config directory is required}
+secret_dir=${5:?enrollment response directory is required}
+quiet_seconds=${GONZBNET_SOAK_QUIET_SECONDS:-660}
+: "${GONZBNET_E2E_TRAVERSAL_HOST:?set the traversal coordinator hostname}"
+
+case "$duration_seconds:$quiet_seconds" in
+	*[!0-9:]*) echo "durations must be whole seconds" >&2; exit 2 ;;
+esac
+if (( duration_seconds < quiet_seconds + 600 )); then
+	echo "duration must leave at least ten minutes after the quiet phase" >&2
+	exit 2
+fi
+
+for command in curl jq ps setsid; do
+	command -v "$command" >/dev/null 2>&1 || { echo "$command is required" >&2; exit 2; }
+done
+for node in a b c d; do
+	test -s "$secret_dir/node-$node.json"
+	test -s "$config_dir/node-$node.yaml"
+done
+install -d -m 700 "$artifact_dir"
+
+export GONZB_SOAK_A_TOKEN
+export GONZB_SOAK_B_TOKEN
+export GONZB_SOAK_C_TOKEN
+export GONZB_SOAK_D_TOKEN
+GONZB_SOAK_A_TOKEN=$(jq -er .token "$secret_dir/node-a.json")
+GONZB_SOAK_B_TOKEN=$(jq -er .token "$secret_dir/node-b.json")
+GONZB_SOAK_C_TOKEN=$(jq -er .token "$secret_dir/node-c.json")
+GONZB_SOAK_D_TOKEN=$(jq -er .token "$secret_dir/node-d.json")
+
+export GONZBNET_NODE_A_CONFIG="$config_dir/node-a.yaml"
+export GONZBNET_NODE_B_CONFIG="$config_dir/node-b.yaml"
+export GONZBNET_NODE_C_CONFIG="$config_dir/node-c.yaml"
+export GONZBNET_NODE_D_CONFIG="$config_dir/node-d.yaml"
+export GONZBNET_E2E_TRANSPORT=traversal
+export GONZBNET_E2E_TRAVERSAL_HOST
+
+state="$gonzb_root/.e2e/gonzbnet"
+e2e="$gonzb_root/scripts/gonzbnet_e2e.sh"
+resources="$artifact_dir/application-resources.jsonl"
+timeline="$artifact_dir/application-timeline.log"
+started_epoch=$(date +%s)
+deadline_epoch=$((started_epoch + duration_seconds))
+
+timeline() {
+	printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$timeline"
+}
+
+node_spec() {
+	case "$1" in
+		a) echo 'node-a:18081' ;;
+		b) echo 'node-b:18082' ;;
+		c) echo 'node-c:18083' ;;
+		d) echo 'node-d:18084' ;;
+	esac
+}
+
+set_exchange_mode() {
+	enabled=$1
+	for node in a b c d; do
+		spec=$(node_spec "$node")
+		name=${spec%:*}
+		port=${spec#*:}
+		current=$(curl -fsS -b "$state/$name/cookies.txt" "http://127.0.0.1:$port/api/v1/admin/settings")
+		payload=$(printf '%s' "$current" | jq --argjson enabled "$enabled" \
+			'del(.revision) |
+			 .gonzbnet.pull_sync_enabled=$enabled |
+			 .gonzbnet.push_sync_enabled=$enabled |
+			 .gonzbnet.websocket_gossip_enabled=$enabled')
+		csrf=$(tr -d '\r\n' <"$state/$name/csrf-token")
+		curl -fsS -X PUT -b "$state/$name/cookies.txt" -H "X-CSRF-Token: $csrf" \
+			-H 'Content-Type: application/json' -d "$payload" \
+			"http://127.0.0.1:$port/api/v1/admin/settings" >/dev/null
+	done
+}
+
+assert_healthy() {
+	for port in 18081 18082 18083 18084; do
+		curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null
+	done
+}
+
+sample_resources() {
+	timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	for node in a b c d; do
+		spec=$(node_spec "$node")
+		name=${spec%:*}
+		pid=$(tr -d '\r\n' <"$state/$name/pid")
+		if kill -0 "$pid" 2>/dev/null; then
+			rss_kib=$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status")
+			threads=$(awk '/^Threads:/ {print $2}' "/proc/$pid/status")
+			fds=$(find "/proc/$pid/fd" -mindepth 1 -maxdepth 1 -printf . 2>/dev/null | wc -c)
+			jq -cn --arg timestamp "$timestamp" --arg component "$name" --argjson pid "$pid" \
+				--argjson rss_kib "${rss_kib:-0}" --argjson threads "${threads:-0}" --argjson fds "$fds" \
+				'{timestamp:$timestamp,component:$component,pid:$pid,rss_kib:$rss_kib,threads:$threads,fds:$fds}' >>"$resources"
+		fi
+	done
+	docker stats --no-stream --format '{{json .}}' gonzbnet-e2e-postgres 2>/dev/null |
+		jq -c --arg timestamp "$timestamp" '. + {timestamp:$timestamp,component:"postgres"}' >>"$resources" || true
+}
+
+run_exchange() {
+	label=$1
+	"$e2e" federation-smoke >"$artifact_dir/federation-$label.log" 2>&1
+	if (( 10#$label % 2 == 0 )); then
+		"$e2e" release-smoke >"$artifact_dir/release-$label.log" 2>&1
+	fi
+	timeline "exchange cycle=$label passed"
+}
+
+restart_node_c() {
+	before=$(curl -fsS http://127.0.0.1:18083/gonzbnet/v1/node | jq -er .node_id)
+	pid=$(tr -d '\r\n' <"$state/node-c/pid")
+	kill "$pid"
+	for _ in $(seq 1 50); do
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 0.1
+	done
+	rm -f "$state/node-c/pid"
+	(
+		cd "$gonzb_root"
+		setsid env SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+			"$state/gonzb" serve --config "$GONZBNET_NODE_C_CONFIG" </dev/null >"$state/node-c/stdout.log" 2>&1 &
+		echo "$!" >"$state/node-c/pid"
+	)
+	for _ in $(seq 1 60); do
+		curl -fsS http://127.0.0.1:18083/healthz >/dev/null 2>&1 && break
+		sleep 1
+	done
+	after=$(curl -fsS http://127.0.0.1:18083/gonzbnet/v1/node | jq -er .node_id)
+	test "$after" = "$before"
+	timeline "node-c restart retained identity=$after"
+}
+
+timeline "soak started duration_seconds=$duration_seconds quiet_seconds=$quiet_seconds"
+set_exchange_mode false
+quiet_deadline=$((started_epoch + quiet_seconds))
+minute=0
+while (( $(date +%s) < quiet_deadline )); do
+	minute=$((minute + 1))
+	assert_healthy
+	sample_resources
+	timeline "quiet minute=$minute healthy"
+	now=$(date +%s)
+	sleep_for=$((started_epoch + minute * 60 - now))
+	(( sleep_for > 0 )) && sleep "$sleep_for"
+done
+
+"$e2e" federation-smoke >"$artifact_dir/federation-after-idle.log" 2>&1
+"$e2e" release-smoke >"$artifact_dir/release-after-idle.log" 2>&1
+timeline "post-idle signed event and manifest exchange passed"
+set_exchange_mode true
+timeline "push pull and gossip schedulers enabled"
+
+cycle=0
+node_restarted=false
+while (( $(date +%s) < deadline_epoch )); do
+	cycle=$((cycle + 1))
+	for _ in 1 2 3 4 5; do
+		(( $(date +%s) >= deadline_epoch )) && break
+		assert_healthy
+		sample_resources
+		timeline "active minute=$((minute + 1)) healthy"
+		minute=$((minute + 1))
+		sleep 60
+	done
+	(( $(date +%s) >= deadline_epoch )) && break
+	run_exchange "$cycle"
+	if [[ "$node_restarted" = false ]] && (( $(date +%s) - started_epoch >= 1800 )); then
+		restart_node_c
+		node_restarted=true
+	fi
+done
+
+assert_healthy
+"$e2e" federation-smoke >"$artifact_dir/federation-final.log" 2>&1
+"$e2e" release-smoke >"$artifact_dir/release-final.log" 2>&1
+"$e2e" smoke >"$artifact_dir/smoke-final.log" 2>&1
+"$e2e" observability-smoke >"$artifact_dir/observability-final.log" 2>&1
+sample_resources
+timeline "soak completed all final application assertions passed"

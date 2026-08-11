@@ -1,0 +1,6 @@
+https://connect.lab.test {
+	tls /run/lab/tls/server.pem /run/lab/tls/server-key.pem
+	@admin path /v1/admin/*
+	respond @admin 404
+	reverse_proxy coordinator:8080
+}

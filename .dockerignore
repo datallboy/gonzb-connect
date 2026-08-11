@@ -1,0 +1,10 @@
+.git
+.env
+.test-state
+artifacts
+coverage.out
+deploy/tls
+deploy/secrets
+*.pcap
+*.pcapng
+gonzb-connect-coordinator

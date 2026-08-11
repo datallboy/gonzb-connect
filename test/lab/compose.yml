@@ -1,0 +1,254 @@
+name: gonzb-connect-lab
+
+x-peer-common: &peer-common
+  build:
+    context: ../..
+    dockerfile: test/lab/peer.Dockerfile
+    network: host
+  image: gonzb-connect-lab-peer:local
+  cap_drop: [ALL]
+  # SETUID/SETGID are used only by the root entrypoint after it replaces the
+  # default route. su-exec then starts the workload as UID/GID 1000 with no
+  # effective capabilities and no-new-privileges set.
+  cap_add: [NET_ADMIN, SETUID, SETGID]
+  security_opt: [no-new-privileges:true]
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  environment: &peer-environment
+    SSL_CERT_FILE: /run/lab/tls/ca.pem
+    PION_LOG_WARN: ${LAB_PION_LOG_WARN:-}
+  extra_hosts:
+    - "connect.lab.test:172.30.0.10"
+    - "turn.lab.test:172.30.0.20"
+  volumes:
+    - ${LAB_STATE:?run test/lab/labctl init first}/tls:/run/lab/tls:ro
+    - ${LAB_STATE}/identities:/run/lab/identities:ro
+    - ${LAB_STATE}/credentials:/run/lab/credentials:ro
+    - ${LAB_STATE}/canary:/run/lab/canary:ro
+    - ${LAB_STATE}/api-canary:/run/lab/api-canary:ro
+  pids_limit: 256
+  mem_limit: 768m
+  cpus: 2.0
+
+x-router-common: &router-common
+  build:
+    context: ../..
+    dockerfile: test/lab/router/Dockerfile
+    network: host
+  image: gonzb-connect-lab-router:local
+  cap_drop: [ALL]
+  cap_add: [NET_ADMIN, NET_RAW]
+  security_opt: [no-new-privileges:true]
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=4m
+  sysctls:
+    net.ipv4.ip_forward: "1"
+  environment: &router-environment
+    LAB_POLICY: ${LAB_POLICY:-home-nat}
+    LAB_WAN_CIDR: 172.30.0.0/24
+    LAB_CONNECT_ADDRESS: 172.30.0.10
+    LAB_TURN_ADDRESS: 172.30.0.20
+  pids_limit: 64
+  mem_limit: 128m
+  cpus: 0.5
+
+services:
+  postgres:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    environment:
+      POSTGRES_DB: gonzb_connect
+      POSTGRES_USER: gonzb_connect
+      POSTGRES_PASSWORD_FILE: /run/lab/secrets/postgres_password
+    volumes:
+      - ${LAB_STATE}/secrets:/run/lab/secrets:ro
+      - connect-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gonzb_connect -d gonzb_connect"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [backend]
+
+  coordinator:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      network: host
+    image: gonzb-connect-coordinator:local
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      LISTEN_ADDR: :8080
+      DATABASE_URL_FILE: /run/lab/secrets/database_url
+      ADMIN_TOKEN_FILE: /run/lab/secrets/admin_token
+      TURN_SHARED_SECRET_FILE: /run/lab/secrets/turn_shared_secret
+      MAX_CONCURRENT_AUTH: "2"
+      STUN_URIS: ${LAB_STUN_URIS:-stun:turn.lab.test:3478}
+      TURN_URIS: ${LAB_TURN_URIS:-turn:turn.lab.test:3478?transport=udp,turn:turn.lab.test:3478?transport=tcp,turns:turn.lab.test:5349?transport=tcp}
+    volumes:
+      - ${LAB_STATE}/secrets:/run/lab/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18080:8080"
+    networks:
+      backend:
+      wan:
+        ipv4_address: 172.30.0.11
+
+  caddy:
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    user: "1000:1000"
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+      - /data:rw,noexec,nosuid,size=16m
+      - /config:rw,noexec,nosuid,size=4m
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${LAB_STATE}/tls:/run/lab/tls:ro
+    ports:
+      - "127.0.0.1:18443:443"
+    depends_on: [coordinator]
+    networks:
+      backend:
+      wan:
+        ipv4_address: 172.30.0.10
+
+  coturn:
+    image: coturn/coturn:4.7.0@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93
+    user: "1000:1000"
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /run/coturn:rw,noexec,nosuid,size=1m
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        printf 'static-auth-secret=%s\n' "$$(cat /run/lab/secrets/turn_shared_secret)" > /run/coturn/secret.conf
+        exec turnserver -c /run/coturn/secret.conf \
+          --fingerprint --use-auth-secret --realm=turn.lab.test --server-name=turn.lab.test \
+          --listening-ip=172.30.0.20 --relay-ip=172.30.0.20 \
+          --no-cli --no-multicast-peers --stale-nonce=600 --log-file=stdout \
+          --pidfile=/run/coturn/turnserver.pid \
+          --total-quota=64 --user-quota=8 --max-bps=10485760 --bps-capacity=52428800 \
+          --min-port=49160 --max-port=49260 \
+          --cert=/run/lab/tls/server.pem --pkey=/run/lab/tls/server-key.pem
+    volumes:
+      - ${LAB_STATE}/secrets:/run/lab/secrets:ro
+      - ${LAB_STATE}/tls:/run/lab/tls:ro
+    networks:
+      wan:
+        ipv4_address: 172.30.0.20
+
+  router-a:
+    <<: *router-common
+    environment:
+      <<: *router-environment
+      LAB_LAN_ADDRESS: 10.10.1.254
+      LAB_LAN_CIDR: 10.10.1.0/24
+      LAB_PEER_ADDRESS: 10.10.1.10
+      LAB_WAN_ADDRESS: 172.30.0.101
+    networks:
+      lan-a:
+        ipv4_address: 10.10.1.254
+      wan:
+        ipv4_address: 172.30.0.101
+
+  router-b:
+    <<: *router-common
+    environment:
+      <<: *router-environment
+      LAB_LAN_ADDRESS: 10.10.2.254
+      LAB_LAN_CIDR: 10.10.2.0/24
+      LAB_PEER_ADDRESS: 10.10.2.10
+      LAB_WAN_ADDRESS: 172.30.0.102
+    networks:
+      lan-b:
+        ipv4_address: 10.10.2.254
+      wan:
+        ipv4_address: 172.30.0.102
+
+  peer-b:
+    <<: *peer-common
+    container_name: gonzb-connect-lab-peer-b
+    environment:
+      <<: *peer-environment
+      LAB_GATEWAY: 10.10.2.254
+    command:
+      - serve
+      - -identity-file=/run/lab/identities/node-b.key
+      - -credential-file=/run/lab/credentials/node-b.token
+      - -coordinator=https://connect.lab.test
+      - -ice-server-hosts=turn.lab.test
+      - -allow-turn=${LAB_ALLOW_TURN:-true}
+      - -gather-timeout=${LAB_GATHER_TIMEOUT:-10s}
+    depends_on: [router-b, caddy, coturn]
+    networks:
+      lan-b:
+        ipv4_address: 10.10.2.10
+
+  peer-b-lan:
+    <<: *peer-common
+    container_name: gonzb-connect-lab-peer-b-lan
+    profiles: [lan]
+    environment:
+      <<: *peer-environment
+      LAB_GATEWAY: 10.10.1.254
+    command:
+      - serve
+      - -identity-file=/run/lab/identities/node-b.key
+      - -credential-file=/run/lab/credentials/node-b.token
+      - -coordinator=https://connect.lab.test
+      - -ice-server-hosts=turn.lab.test
+      - -allow-turn=${LAB_ALLOW_TURN:-true}
+      - -gather-timeout=${LAB_GATHER_TIMEOUT:-10s}
+    depends_on: [router-a, caddy, coturn]
+    networks:
+      lan-a:
+        ipv4_address: 10.10.1.11
+
+  peer-a:
+    <<: *peer-common
+    profiles: [runner]
+    environment:
+      <<: *peer-environment
+      LAB_GATEWAY: 10.10.1.254
+    depends_on: [router-a, caddy, coturn]
+    networks:
+      lan-a:
+        ipv4_address: 10.10.1.10
+
+networks:
+  backend:
+    internal: true
+  wan:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  lan-a:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+  lan-b:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
+
+volumes:
+  connect-db:

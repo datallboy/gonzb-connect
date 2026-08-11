@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+COMPOSE_FILE="$ROOT/test/lab/compose.yml"
+STATE=${GONZB_CONNECT_LAB_STATE:-$ROOT/.test-state/lab}
+POLICY=${LAB_POLICY:-home-nat}
+ALLOW_TURN=${LAB_ALLOW_TURN:-true}
+GATHER_TIMEOUT=${LAB_GATHER_TIMEOUT:-10s}
+CONNECT_TIMEOUT=${LAB_CONNECT_TIMEOUT:-10s}
+REQUEST_TIMEOUT=${LAB_REQUEST_TIMEOUT:-20s}
+PION_LOG_WARN=${LAB_PION_LOG_WARN:-}
+STUN_URIS=${LAB_STUN_URIS:-stun:turn.lab.test:3478}
+TURN_URIS=${LAB_TURN_URIS:-turn:turn.lab.test:3478?transport=udp,turn:turn.lab.test:3478?transport=tcp,turns:turn.lab.test:5349?transport=tcp}
+RUN_ARTIFACT_DIR=${RUN_ARTIFACT_DIR:-$STATE/artifacts}
+CAPTURE_NAMES=()
+CAPTURE_PIDS=()
+
+compose() {
+  LAB_STATE="$STATE" LAB_POLICY="$POLICY" LAB_ALLOW_TURN="$ALLOW_TURN" \
+    LAB_GATHER_TIMEOUT="$GATHER_TIMEOUT" LAB_PION_LOG_WARN="$PION_LOG_WARN" \
+    LAB_STUN_URIS="$STUN_URIS" LAB_TURN_URIS="$TURN_URIS" \
+    docker compose -f "$COMPOSE_FILE" "$@"
+}
+
+die() {
+  echo "labctl: $*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required"
+}
+
+preflight() {
+  for command in docker openssl curl jq go; do
+    need "$command"
+  done
+  docker info >/dev/null
+  docker compose version >/dev/null
+  available_kib=$(df -Pk "$ROOT" | awk 'NR == 2 {print $4}')
+  [ "${available_kib:-0}" -ge 10485760 ] || die "at least 10 GiB of free disk is required"
+  case "$(uname -s)" in
+    Linux) ;;
+    *) die "the traversal network lab requires Linux" ;;
+  esac
+  echo "preflight passed: state=$STATE"
+}
+
+random_hex_file() {
+  file_name="$1"
+  bytes="$2"
+  temporary="$file_name.tmp"
+  openssl rand -hex "$bytes" >"$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$file_name"
+}
+
+generate_tls() {
+  if [ -s "$STATE/tls/ca.pem" ] && [ -s "$STATE/tls/server.pem" ] && [ -s "$STATE/tls/server-key.pem" ]; then
+    return
+  fi
+  openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+    -keyout "$STATE/tls/ca-key.pem" -out "$STATE/tls/ca.pem" -days 7 \
+    -subj "/CN=GoNZB Connect Lab CA" >/dev/null 2>&1
+  openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+    -keyout "$STATE/tls/server-key.pem" -out "$STATE/tls/server.csr" \
+    -subj "/CN=connect.lab.test" >/dev/null 2>&1
+  cat >"$STATE/tls/server.ext" <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:connect.lab.test,DNS:turn.lab.test,IP:172.30.0.10,IP:172.30.0.20
+EOF
+  openssl x509 -req -in "$STATE/tls/server.csr" -CA "$STATE/tls/ca.pem" -CAkey "$STATE/tls/ca-key.pem" \
+    -CAcreateserial -out "$STATE/tls/server.pem" -days 7 -extfile "$STATE/tls/server.ext" >/dev/null 2>&1
+  chmod 0600 "$STATE/tls/ca-key.pem" "$STATE/tls/server-key.pem"
+  chmod 0644 "$STATE/tls/ca.pem" "$STATE/tls/server.pem"
+}
+
+init() {
+  preflight
+  umask 077
+  mkdir -p "$STATE/bin" "$STATE/credentials" "$STATE/identities" "$STATE/secrets" "$STATE/tls" "$STATE/artifacts"
+  [ -s "$STATE/secrets/postgres_password" ] || random_hex_file "$STATE/secrets/postgres_password" 24
+  [ -s "$STATE/secrets/admin_token" ] || random_hex_file "$STATE/secrets/admin_token" 32
+  [ -s "$STATE/secrets/turn_shared_secret" ] || random_hex_file "$STATE/secrets/turn_shared_secret" 32
+  if [ ! -s "$STATE/secrets/database_url" ]; then
+    password=$(tr -d '\r\n' <"$STATE/secrets/postgres_password")
+    printf 'postgres://gonzb_connect:%s@postgres:5432/gonzb_connect?sslmode=disable\n' "$password" >"$STATE/secrets/database_url"
+    chmod 0600 "$STATE/secrets/database_url"
+  fi
+  [ -s "$STATE/canary" ] || random_hex_file "$STATE/canary" 32
+  [ -s "$STATE/api-canary" ] || random_hex_file "$STATE/api-canary" 32
+  generate_tls
+  (cd "$ROOT" && go build -trimpath -o "$STATE/bin/gonzb-connect-lab-peer" ./cmd/gonzb-connect-lab-peer)
+  "$STATE/bin/gonzb-connect-lab-peer" identity -identity-file "$STATE/identities/node-a.key" >"$STATE/identities/node-a.json"
+  "$STATE/bin/gonzb-connect-lab-peer" identity -identity-file "$STATE/identities/node-b.key" >"$STATE/identities/node-b.json"
+  chmod 0600 "$STATE/identities/"*
+  echo "lab state initialized"
+}
+
+build() {
+  init
+  compose build coordinator peer-a router-a
+}
+
+wait_url() {
+  description="$1"
+  shift
+  for _ in $(seq 1 90); do
+    if "$@" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 1
+  done
+  die "$description did not become ready"
+}
+
+start_infra() {
+  build
+  compose up -d postgres coordinator caddy coturn router-a router-b
+  wait_url "coordinator" curl -fsS http://127.0.0.1:18080/healthz
+  wait_url "public TLS endpoint" curl -fsS --cacert "$STATE/tls/ca.pem" \
+    --resolve connect.lab.test:18443:127.0.0.1 https://connect.lab.test:18443/healthz
+  echo "lab infrastructure ready policy=$POLICY"
+}
+
+enroll_node() {
+  node="$1"
+  credential="$STATE/credentials/$node.token"
+  [ -s "$credential" ] && return
+  response="$STATE/credentials/$node.enrollment.tmp"
+  admin_token=$(tr -d '\r\n' <"$STATE/secrets/admin_token")
+  curl -fsS -X POST -H "Authorization: Bearer $admin_token" \
+    http://127.0.0.1:18080/v1/admin/enrollments >"$response"
+  jq -er '.token | select(type == "string" and startswith("gzc_"))' "$response" >"$credential"
+  chmod 0600 "$credential"
+  rm -f "$response"
+}
+
+prepare() {
+  start_infra
+  enroll_node node-a
+  enroll_node node-b
+}
+
+set_policy() {
+  requested="$1"
+  case "$requested" in
+    home-nat|symmetric-nat|turn-udp-only|turn-tls-only|turn-tls-blackhole) ;;
+    *) die "unsupported policy: $requested" ;;
+  esac
+  POLICY="$requested"
+  compose up -d --force-recreate router-a router-b
+  echo "router policy applied: $POLICY"
+}
+
+stop_peers() {
+  compose rm -sf peer-b >/dev/null 2>&1 || true
+  LAB_STATE="$STATE" LAB_POLICY="$POLICY" LAB_ALLOW_TURN="$ALLOW_TURN" \
+    LAB_GATHER_TIMEOUT="$GATHER_TIMEOUT" LAB_PION_LOG_WARN="$PION_LOG_WARN" \
+    LAB_STUN_URIS="$STUN_URIS" LAB_TURN_URIS="$TURN_URIS" \
+    docker compose --profile lan -f "$COMPOSE_FILE" rm -sf peer-b-lan >/dev/null 2>&1 || true
+}
+
+start_peer_b() {
+  topology="$1"
+  stop_peers
+  case "$topology" in
+    lan)
+      LAB_STATE="$STATE" LAB_POLICY="$POLICY" LAB_ALLOW_TURN="$ALLOW_TURN" \
+        LAB_GATHER_TIMEOUT="$GATHER_TIMEOUT" LAB_PION_LOG_WARN="$PION_LOG_WARN" \
+        LAB_STUN_URIS="$STUN_URIS" LAB_TURN_URIS="$TURN_URIS" \
+        docker compose --profile lan -f "$COMPOSE_FILE" up -d peer-b-lan
+      peer_container=gonzb-connect-lab-peer-b-lan
+      ;;
+    nat)
+      compose up -d peer-b
+      peer_container=gonzb-connect-lab-peer-b
+      ;;
+    *) die "unsupported peer topology: $topology" ;;
+  esac
+  wait_url "peer-b" docker exec "$peer_container" wget -qO- http://127.0.0.1:8080/healthz
+}
+
+run_load() {
+  case_name="$1"
+  expected_path="$2"
+  requests="${3:-100}"
+  body_bytes="${4:-65536}"
+  duration="${5:-}"
+  concurrency="${6:-7}"
+  request_rate="${7:-0}"
+	max_failures="${8:-0}"
+  node_b_id=$(jq -er .node_id "$STATE/identities/node-b.json")
+  target="gonzb+ice://$node_b_id@connect.lab.test/gonzbnet/v1"
+  mkdir -p "$RUN_ARTIFACT_DIR"
+  result="$RUN_ARTIFACT_DIR/$case_name.json"
+  error_log="$RUN_ARTIFACT_DIR/$case_name.stderr.log"
+  duration_args=()
+  if [ -n "$duration" ]; then
+    duration_args=(-duration="$duration")
+  fi
+  LAB_STATE="$STATE" LAB_POLICY="$POLICY" LAB_ALLOW_TURN="$ALLOW_TURN" \
+    LAB_GATHER_TIMEOUT="$GATHER_TIMEOUT" LAB_PION_LOG_WARN="$PION_LOG_WARN" \
+    LAB_STUN_URIS="$STUN_URIS" LAB_TURN_URIS="$TURN_URIS" \
+    docker compose --profile runner -f "$COMPOSE_FILE" run --rm --no-deps peer-a \
+    load \
+    -identity-file=/run/lab/identities/node-a.key \
+    -credential-file=/run/lab/credentials/node-a.token \
+    -coordinator=https://connect.lab.test \
+    -ice-server-hosts=turn.lab.test \
+    -allow-turn="$ALLOW_TURN" \
+    -gather-timeout="$GATHER_TIMEOUT" \
+    -connect-timeout="$CONNECT_TIMEOUT" \
+    -request-timeout="$REQUEST_TIMEOUT" \
+    -target="$target" \
+    -requests="$requests" \
+    "${duration_args[@]}" \
+    -concurrency="$concurrency" \
+    -rate="$request_rate" \
+		-max-failures="$max_failures" \
+    -body-bytes="$body_bytes" \
+    -gossip-every=10 \
+    -canary-file=/run/lab/canary \
+    -api-canary-file=/run/lab/api-canary \
+    -expected-path="$expected_path" 2> >(tee "$error_log" >&2) | tee "$result"
+  jq -e --arg path "$expected_path" --argjson max_failures "$max_failures" \
+		'.requests_failed <= $max_failures and .requests_succeeded > 0 and (.status.peers | any(.path_type == $path and .connection_state == "connected"))' \
+    "$result" >/dev/null
+}
+
+run_case() {
+  case_name="$1"
+  prepare
+  case "$case_name" in
+    lan-direct)
+      ALLOW_TURN=true
+      set_policy home-nat
+      start_peer_b lan
+      run_load "$case_name" direct
+      ;;
+    independent-nat)
+      ALLOW_TURN=true
+      set_policy home-nat
+      start_peer_b nat
+      run_load "$case_name" direct
+      ;;
+    independent-nat-no-turn)
+      ALLOW_TURN=false
+      set_policy home-nat
+      start_peer_b nat
+      run_load "$case_name" direct
+      ;;
+    symmetric-nat)
+      ALLOW_TURN=true
+      set_policy symmetric-nat
+      start_peer_b nat
+      run_load "$case_name" relay
+      ;;
+    turn-udp)
+      ALLOW_TURN=true
+			TURN_URIS=turn:turn.lab.test:3478?transport=udp
+      set_policy turn-udp-only
+      start_peer_b nat
+      run_load "$case_name" relay
+      ;;
+    turn-tls)
+      ALLOW_TURN=true
+			TURN_URIS=turns:turn.lab.test:5349?transport=tcp
+			CONNECT_TIMEOUT=20s
+      set_policy turn-tls-only
+      start_peer_b nat
+      run_load "$case_name" relay
+      ;;
+    turn-tls-blackhole)
+      ALLOW_TURN=true
+			CONNECT_TIMEOUT=20s
+      set_policy turn-tls-blackhole
+      start_peer_b nat
+      run_load "$case_name" relay
+      ;;
+    *) die "unknown case: $case_name" ;;
+  esac
+}
+
+capture_start() {
+  service="$1"
+  label="$2"
+  shift 2
+  target=$(compose ps -q "$service")
+  [ -n "$target" ] || die "capture target is not running: $service"
+  name="gonzb-connect-lab-capture-$label"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run --rm --name "$name" --network "container:$target" \
+    --cap-drop ALL --cap-add NET_RAW --security-opt no-new-privileges:true \
+    --read-only --tmpfs /tmp:rw,noexec,nosuid,size=4m --pids-limit 32 --memory 64m \
+    --entrypoint tcpdump gonzb-connect-lab-router:local \
+    -U -n -i any -s 0 -w - "$@" >"$RUN_ARTIFACT_DIR/$label.pcap" 2>"$RUN_ARTIFACT_DIR/$label.tcpdump.log" &
+  CAPTURE_NAMES+=("$name")
+  CAPTURE_PIDS+=("$!")
+  for _ in $(seq 1 30); do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" = true ]; then
+      return
+    fi
+    sleep 0.2
+  done
+  die "packet capture did not start: $label"
+}
+
+captures_stop() {
+  for name in "${CAPTURE_NAMES[@]}"; do
+    docker stop --time 5 "$name" >/dev/null 2>&1 || true
+  done
+  for capture_pid in "${CAPTURE_PIDS[@]}"; do
+    wait "$capture_pid" 2>/dev/null || true
+  done
+  CAPTURE_NAMES=()
+  CAPTURE_PIDS=()
+}
+
+fetch_turn_credentials() {
+  output="$STATE/secrets/capture-turn-response.json"
+  umask 077
+  compose --profile runner run --rm --no-deps peer-a \
+    turn-credentials \
+    -identity-file=/run/lab/identities/node-a.key \
+    -credential-file=/run/lab/credentials/node-a.token \
+    -coordinator=https://connect.lab.test \
+    -ice-server-hosts=turn.lab.test >"$output"
+  chmod 0600 "$output"
+  jq -e '.credential | type == "string" and length > 0' "$output" >/dev/null
+}
+
+collect_artifacts() {
+  artifact_dir="$1"
+  for service in coordinator caddy coturn postgres router-a router-b peer-b peer-b-lan; do
+    container_id=$(compose ps -q "$service" 2>/dev/null || true)
+    if [ -n "$container_id" ]; then
+      docker logs "$container_id" >"$artifact_dir/$service.log" 2>&1 || true
+    fi
+  done
+  postgres_id=$(compose ps -q postgres)
+  docker exec "$postgres_id" pg_dump --data-only --no-owner --no-privileges -U gonzb_connect gonzb_connect \
+    >"$artifact_dir/coordinator-database.sql"
+  for router in router-a router-b; do
+    router_id=$(compose ps -q "$router")
+    docker exec "$router_id" nft list ruleset >"$artifact_dir/$router.nft"
+    docker exec "$router_id" conntrack -L >"$artifact_dir/$router.conntrack" 2>&1 || true
+  done
+  admin_token=$(tr -d '\r\n' <"$STATE/secrets/admin_token")
+  curl -fsS -H "Authorization: Bearer $admin_token" http://127.0.0.1:18080/v1/admin/metrics \
+    >"$artifact_dir/coordinator.metrics"
+  {
+    uname -a
+    docker version
+    docker image inspect gonzb-connect-coordinator:local gonzb-connect-lab-peer:local gonzb-connect-lab-router:local \
+      --format '{{.RepoTags}} {{.Id}}'
+  } >"$artifact_dir/environment.txt"
+}
+
+scan_capture_artifacts() {
+  artifact_dir="$1"
+  secret_dir="$STATE/secrets/capture-scan"
+  mkdir -p "$secret_dir"
+  chmod 0700 "$secret_dir"
+  cp "$STATE/canary" "$secret_dir/release-canary"
+  cp "$STATE/api-canary" "$secret_dir/api-canary"
+  cp "$STATE/credentials/node-a.token" "$secret_dir/enrollment-token"
+  jq -er .credential "$STATE/secrets/capture-turn-response.json" >"$secret_dir/turn-credential"
+  chmod 0600 "$secret_dir/"*
+  "$ROOT/test/lab/scan-artifacts" "$artifact_dir" "$secret_dir" | tee "$artifact_dir/scan-result.txt"
+}
+
+capture_case() {
+  case_name="${1:-turn-udp}"
+  prepare
+  case "$case_name" in
+    lan-direct)
+      ALLOW_TURN=true
+      set_policy home-nat
+      start_peer_b lan
+      expected_path=direct
+      ;;
+    turn-udp)
+      ALLOW_TURN=true
+			TURN_URIS=turn:turn.lab.test:3478?transport=udp
+      set_policy turn-udp-only
+      start_peer_b nat
+      expected_path=relay
+      ;;
+    turn-tls)
+      ALLOW_TURN=true
+			TURN_URIS=turns:turn.lab.test:5349?transport=tcp
+			CONNECT_TIMEOUT=20s
+      set_policy turn-tls-only
+      start_peer_b nat
+      expected_path=relay
+      ;;
+    *) die "capture supports lan-direct, turn-udp, or turn-tls" ;;
+  esac
+  run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
+  RUN_ARTIFACT_DIR="$STATE/artifacts/capture-$case_name-$run_id"
+  mkdir -p "$RUN_ARTIFACT_DIR"
+  capture_start caddy caddy-public tcp port 443
+  capture_start caddy caddy-backend tcp port 8080
+  capture_start coturn coturn
+  capture_start router-a router-a
+  capture_start router-b router-b
+  if ! fetch_turn_credentials || ! run_load "capture-$case_name" "$expected_path" 10 10485760 "" 1; then
+    captures_stop
+    collect_artifacts "$RUN_ARTIFACT_DIR"
+    return 1
+  fi
+  captures_stop
+  collect_artifacts "$RUN_ARTIFACT_DIR"
+  scan_capture_artifacts "$RUN_ARTIFACT_DIR"
+  echo "capture qualification passed: $RUN_ARTIFACT_DIR"
+}
+
+sample_resources() {
+  output="$1"
+	while :; do
+		timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+		mapfile -t container_ids < <(docker ps --filter label=com.docker.compose.project=gonzb-connect-lab -q)
+		if [ "${#container_ids[@]}" -gt 0 ]; then
+			docker stats --no-stream --format '{{json .}}' "${container_ids[@]}" 2>/dev/null |
+				jq -c --arg timestamp "$timestamp" '. + {timestamp: $timestamp}' >>"$output" || true
+		fi
+		# docker stats samples for approximately one second; this keeps the
+		# overall cadence close to five seconds rather than N containers x 1s.
+		sleep 4
+	done
+}
+
+run_soak() {
+  duration="${1:-5m}"
+  mode="${2:-both}"
+  case "$duration" in
+    *[!0-9smh.]*) die "invalid soak duration" ;;
+  esac
+  case "$mode" in
+    direct|turn-tls) soak_cases=("$mode") ;;
+    both) soak_cases=(direct turn-tls) ;;
+    *) die "soak mode must be direct, turn-tls, or both" ;;
+  esac
+  run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
+  RUN_ARTIFACT_DIR="$STATE/artifacts/soak-$run_id"
+  mkdir -p "$RUN_ARTIFACT_DIR"
+  for soak_case in "${soak_cases[@]}"; do
+    prepare
+    if [ "$soak_case" = direct ]; then
+      ALLOW_TURN=true
+      set_policy home-nat
+      start_peer_b lan
+      expected_path=direct
+    else
+      ALLOW_TURN=true
+			TURN_URIS=turns:turn.lab.test:5349?transport=tcp
+			CONNECT_TIMEOUT=20s
+      set_policy turn-tls-only
+      start_peer_b nat
+      expected_path=relay
+    fi
+    samples="$RUN_ARTIFACT_DIR/$soak_case.resources.jsonl"
+    sample_resources "$samples" &
+    sampler_pid=$!
+    if ! run_load "soak-$soak_case" "$expected_path" 0 1048576 "$duration" 7 1.5; then
+      kill "$sampler_pid" >/dev/null 2>&1 || true
+      wait "$sampler_pid" 2>/dev/null || true
+      collect_artifacts "$RUN_ARTIFACT_DIR"
+      return 1
+    fi
+    kill "$sampler_pid" >/dev/null 2>&1 || true
+    wait "$sampler_pid" 2>/dev/null || true
+  done
+  collect_artifacts "$RUN_ARTIFACT_DIR"
+  echo "soak passed: $RUN_ARTIFACT_DIR"
+}
+
+wait_peer_path() {
+	expected="$1"
+	attempts="${2:-60}"
+	while [ "$attempts" -gt 0 ]; do
+		status=$(docker exec gonzb-connect-lab-peer-b wget -qO- http://127.0.0.1:8080/status 2>/dev/null || true)
+		if [ -n "$status" ] && printf '%s' "$status" | jq -e --arg path "$expected" \
+			'.peers | any(.path_type == $path and .connection_state == "connected")' >/dev/null 2>&1; then
+			printf '%s\n' "$status"
+			return 0
+		fi
+		attempts=$((attempts - 1))
+		sleep 1
+	done
+	return 1
+}
+
+cut_active_direct_path() {
+	router_a=$(compose ps -q router-a)
+	router_b=$(compose ps -q router-b)
+	docker exec "$router_a" nft insert rule inet lab_filter forward \
+		ip saddr 10.10.1.0/24 ip daddr 172.30.0.102 meta l4proto udp counter drop
+	docker exec "$router_b" nft insert rule inet lab_filter forward \
+		ip saddr 10.10.2.0/24 ip daddr 172.30.0.101 meta l4proto udp counter drop
+}
+
+run_path_cut() {
+	duration="${1:-90s}"
+	run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
+	RUN_ARTIFACT_DIR="$STATE/artifacts/path-cut-$run_id"
+	mkdir -p "$RUN_ARTIFACT_DIR"
+	prepare
+	ALLOW_TURN=true
+	TURN_URIS=turn:turn.lab.test:3478?transport=udp
+	CONNECT_TIMEOUT=20s
+	REQUEST_TIMEOUT=45s
+	set_policy home-nat
+	start_peer_b nat
+	run_load path-cut relay 0 1048576 "$duration" 1 1 128 &
+	load_pid=$!
+	if ! wait_peer_path direct 30 >"$RUN_ARTIFACT_DIR/status-before-cut.json"; then
+		kill "$load_pid" >/dev/null 2>&1 || true
+		wait "$load_pid" 2>/dev/null || true
+		collect_artifacts "$RUN_ARTIFACT_DIR"
+		die "direct path did not become active before fault injection"
+	fi
+	cut_active_direct_path
+	date -u +%Y-%m-%dT%H:%M:%SZ >"$RUN_ARTIFACT_DIR/path-cut-at.txt"
+	if ! wait_peer_path relay 45 >"$RUN_ARTIFACT_DIR/status-after-recovery.json"; then
+		kill "$load_pid" >/dev/null 2>&1 || true
+		wait "$load_pid" 2>/dev/null || true
+		collect_artifacts "$RUN_ARTIFACT_DIR"
+		die "ICE restart did not recover over TURN relay"
+	fi
+	if ! wait "$load_pid"; then
+		collect_artifacts "$RUN_ARTIFACT_DIR"
+		return 1
+	fi
+	jq -e '(.requests_succeeded >= ((.duration_ms / 2000) | floor)) and .requests_failed <= 128 and
+		(.requests_failed == 0 or .requests_succeeded_after_failure >= 10) and
+		(.status.peers | any(.path_type == "relay" and .connection_state == "connected" and .restarts >= 1))' \
+		"$RUN_ARTIFACT_DIR/path-cut.json" >/dev/null
+	collect_artifacts "$RUN_ARTIFACT_DIR"
+	echo "active direct-path cut recovered over relay: $RUN_ARTIFACT_DIR"
+}
+
+matrix() {
+  for case_name in lan-direct independent-nat turn-udp turn-tls; do
+    echo "running matrix case: $case_name"
+    run_case "$case_name"
+  done
+  echo "local matrix passed"
+}
+
+status() {
+  compose ps
+  if [ -s "$STATE/secrets/admin_token" ]; then
+    admin_token=$(tr -d '\r\n' <"$STATE/secrets/admin_token")
+    curl -fsS -H "Authorization: Bearer $admin_token" http://127.0.0.1:18080/v1/admin/metrics || true
+  fi
+}
+
+stop() {
+  stop_peers
+  compose down --remove-orphans
+}
+
+usage() {
+  echo "usage: test/lab/labctl {preflight|init|build|prepare|case CASE|matrix|capture [CASE]|soak [DURATION [direct|turn-tls|both]]|path-cut [DURATION]|status|stop}"
+}
+
+command=${1:-}
+case "$command" in
+  preflight) preflight ;;
+  init) init ;;
+  build) build ;;
+  prepare) prepare ;;
+  case) [ "$#" -eq 2 ] || die "case name is required"; run_case "$2" ;;
+  matrix) matrix ;;
+  capture) [ "$#" -le 2 ] || die "capture accepts at most one case"; capture_case "${2:-turn-udp}" ;;
+  soak) [ "$#" -le 3 ] || die "soak accepts a duration and optional mode"; run_soak "${2:-5m}" "${3:-both}" ;;
+  path-cut) [ "$#" -le 2 ] || die "path-cut accepts an optional duration"; run_path_cut "${2:-90s}" ;;
+  status) status ;;
+  stop) stop ;;
+  *) usage; exit 2 ;;
+esac

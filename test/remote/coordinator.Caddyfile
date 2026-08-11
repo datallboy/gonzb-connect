@@ -1,0 +1,19 @@
+{$CONNECT_HOST:connect.example.com} {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+		resolvers 1.1.1.1
+	}
+
+	@connect_public path \
+ /gonzb-connect-lab/healthz \
+ /gonzb-connect-lab/v1/signal \
+ /gonzb-connect-lab/v1/turn-credentials
+	handle @connect_public {
+		uri strip_prefix /gonzb-connect-lab
+		reverse_proxy localhost:18082
+	}
+
+	handle {
+		respond "Not Found" 404
+	}
+}

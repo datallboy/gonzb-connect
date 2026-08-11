@@ -1,0 +1,114 @@
+name: gonzb-connect-qualification
+
+services:
+  postgres:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gonzb_connect
+      POSTGRES_USER: gonzb_connect
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - connect-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gonzb_connect -d gonzb_connect"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 256m
+    pids_limit: 128
+    networks: [backend]
+
+  coordinator:
+    image: gonzb-connect-coordinator:remote-test
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    environment:
+      LISTEN_ADDR: ":8080"
+      DATABASE_URL_FILE: /run/secrets/database_url
+      ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      TURN_SHARED_SECRET_FILE: /run/secrets/turn_shared_secret
+      TRUST_PROXY_HEADERS: "true"
+      STUN_URIS: "stun:${TURN_HOST:?set TURN_HOST}:${STUN_PORT:-13478}"
+      TURN_URIS: "turns:${TURN_HOST:?set TURN_HOST}:${TURN_TLS_PORT:-15349}?transport=tcp"
+    secrets: [database_url, admin_token, turn_shared_secret]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${COORDINATOR_PORT:-18082}:8080"
+    networks: [backend, proxy]
+
+  coturn:
+    image: coturn/coturn:4.7.0@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    network_mode: host
+    tmpfs:
+      - /run/coturn:rw,noexec,nosuid,size=1m,uid=65534,gid=65534,mode=0700
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 128m
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        printf 'static-auth-secret=%s\n' "$$(cat /run/secrets/turn_shared_secret)" > /run/coturn/secret.conf
+        exec turnserver -c /run/coturn/secret.conf \
+          --fingerprint --use-auth-secret --realm=${TURN_HOST:?set TURN_HOST} --server-name=${TURN_HOST:?set TURN_HOST} \
+          --listening-ip=${TURN_PUBLIC_IP:?set TURN_PUBLIC_IP} --relay-ip=${TURN_PUBLIC_IP:?set TURN_PUBLIC_IP} \
+          --listening-port=${STUN_PORT:-13478} --tls-listening-port=${TURN_TLS_PORT:-15349} \
+          --min-port=${TURN_RELAY_MIN:-55000} --max-port=${TURN_RELAY_MAX:-55099} \
+          --cert=/run/tls/fullchain.pem --pkey=/run/tls/privkey.pem \
+          --no-cli --no-multicast-peers --no-tcp-relay --stale-nonce=600 --log-file=stdout \
+          --total-quota=$${TURN_TOTAL_QUOTA:-64} --user-quota=$${TURN_USER_QUOTA:-4} \
+          --max-bps=$${TURN_MAX_BPS:-10485760} --bps-capacity=$${TURN_BPS_CAPACITY:-52428800} \
+          --denied-peer-ip=0.0.0.0-0.255.255.255 \
+          --denied-peer-ip=10.0.0.0-10.255.255.255 \
+          --denied-peer-ip=100.64.0.0-100.127.255.255 \
+          --denied-peer-ip=127.0.0.0-127.255.255.255 \
+          --denied-peer-ip=169.254.0.0-169.254.255.255 \
+          --denied-peer-ip=172.16.0.0-172.31.255.255 \
+          --denied-peer-ip=192.0.0.0-192.0.0.255 \
+          --denied-peer-ip=192.0.2.0-192.0.2.255 \
+          --denied-peer-ip=192.168.0.0-192.168.255.255 \
+          --denied-peer-ip=198.18.0.0-198.19.255.255 \
+          --denied-peer-ip=198.51.100.0-198.51.100.255 \
+          --denied-peer-ip=203.0.113.0-203.0.113.255 \
+          --denied-peer-ip=224.0.0.0-255.255.255.255
+    environment:
+      TURN_TOTAL_QUOTA: "${TURN_TOTAL_QUOTA:-64}"
+      TURN_USER_QUOTA: "${TURN_USER_QUOTA:-4}"
+      TURN_MAX_BPS: "${TURN_MAX_BPS:-10485760}"
+      TURN_BPS_CAPACITY: "${TURN_BPS_CAPACITY:-52428800}"
+    secrets: [turn_shared_secret]
+    volumes:
+      - ${GONZB_CONNECT_LAB_ROOT:?set GONZB_CONNECT_LAB_ROOT}/tls:/run/tls:ro
+
+networks:
+  backend:
+    internal: true
+  proxy:
+
+volumes:
+  connect-db:
+
+secrets:
+  database_url:
+    file: ${GONZB_CONNECT_LAB_ROOT:?set GONZB_CONNECT_LAB_ROOT}/secrets/database_url
+  postgres_password:
+    file: ${GONZB_CONNECT_LAB_ROOT:?set GONZB_CONNECT_LAB_ROOT}/secrets/postgres_password
+  admin_token:
+    file: ${GONZB_CONNECT_LAB_ROOT:?set GONZB_CONNECT_LAB_ROOT}/secrets/admin_token
+  turn_shared_secret:
+    file: ${GONZB_CONNECT_LAB_ROOT:?set GONZB_CONNECT_LAB_ROOT}/secrets/turn_shared_secret

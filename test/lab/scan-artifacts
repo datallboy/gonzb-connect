@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: test/lab/scan-artifacts ARTIFACT_DIR SECRET_DIR" >&2
+  exit 2
+fi
+
+ARTIFACT_DIR=$(realpath "$1")
+SECRET_DIR=$(realpath "$2")
+RELEASE_CANARY_FILE="$SECRET_DIR/release-canary"
+API_CANARY_FILE="$SECRET_DIR/api-canary"
+ENROLLMENT_FILE="$SECRET_DIR/enrollment-token"
+TURN_CREDENTIAL_FILE="$SECRET_DIR/turn-credential"
+
+for command in rg tshark xxd awk; do
+  command -v "$command" >/dev/null 2>&1 || { echo "$command is required" >&2; exit 1; }
+done
+for file_name in "$RELEASE_CANARY_FILE" "$API_CANARY_FILE" "$ENROLLMENT_FILE" "$TURN_CREDENTIAL_FILE"; do
+  [ -s "$file_name" ] || { echo "missing scan secret: $file_name" >&2; exit 1; }
+done
+
+work=$(mktemp -d "${ARTIFACT_DIR}/.scan.XXXXXX")
+cleanup() {
+  rm -rf -- "$work"
+}
+trap cleanup EXIT
+
+scan_absent() {
+  pattern_file="$1"
+  target="$2"
+  description="$3"
+  if rg -a -F -q -f "$pattern_file" "$target"; then
+    echo "FAIL: $description appears in $(basename "$target")" >&2
+    return 1
+  fi
+}
+
+reassemble_tcp() {
+  capture="$1"
+  output="$2"
+  : >"$output"
+  tshark -n -r "$capture" -T fields -e tcp.stream 2>/dev/null | awk 'NF {print $1}' | sort -nu | while read -r stream; do
+    tshark -n -r "$capture" -q -z "follow,tcp,raw,$stream" 2>/dev/null |
+      awk '/^[[:space:]]*[[:xdigit:]]+[[:space:]]*$/ { gsub(/[[:space:]]/, ""); print }' |
+      xxd -r -p >>"$output"
+  done
+}
+
+positive="$ARTIFACT_DIR/plaintext-positive-control.txt"
+{
+  printf 'release='
+  cat "$RELEASE_CANARY_FILE"
+  printf 'api='
+  cat "$API_CANARY_FILE"
+} >"$positive"
+rg -a -F -q -f "$RELEASE_CANARY_FILE" "$positive" || { echo "positive control did not detect release canary" >&2; exit 1; }
+rg -a -F -q -f "$API_CANARY_FILE" "$positive" || { echo "positive control did not detect API canary" >&2; exit 1; }
+
+for capture in "$ARTIFACT_DIR"/*.pcap; do
+  [ -e "$capture" ] || continue
+  scan_absent "$RELEASE_CANARY_FILE" "$capture" "release canary"
+  scan_absent "$API_CANARY_FILE" "$capture" "API canary"
+  reassembled="$work/$(basename "$capture").tcp"
+  reassemble_tcp "$capture" "$reassembled"
+  scan_absent "$RELEASE_CANARY_FILE" "$reassembled" "reassembled release canary"
+  scan_absent "$API_CANARY_FILE" "$reassembled" "reassembled API canary"
+  case "$(basename "$capture")" in
+    caddy-public.pcap|coturn.pcap|router-a.pcap|router-b.pcap)
+      scan_absent "$ENROLLMENT_FILE" "$capture" "enrollment token"
+      scan_absent "$TURN_CREDENTIAL_FILE" "$capture" "TURN credential"
+      scan_absent "$ENROLLMENT_FILE" "$reassembled" "reassembled enrollment token"
+      scan_absent "$TURN_CREDENTIAL_FILE" "$reassembled" "reassembled TURN credential"
+      ;;
+  esac
+done
+
+printf '%s\n%s\n' 'a=candidate:' 'a=fingerprint:' >"$work/sdp-patterns"
+for target in "$ARTIFACT_DIR"/*.log "$ARTIFACT_DIR"/coordinator-database.sql; do
+  [ -e "$target" ] || continue
+  scan_absent "$RELEASE_CANARY_FILE" "$target" "release canary"
+  scan_absent "$API_CANARY_FILE" "$target" "API canary"
+  scan_absent "$ENROLLMENT_FILE" "$target" "enrollment token"
+  scan_absent "$TURN_CREDENTIAL_FILE" "$target" "TURN credential"
+  scan_absent "$work/sdp-patterns" "$target" "SDP"
+done
+
+echo "PASS: packet, TCP-reassembly, log, and database scans found no prohibited plaintext"
