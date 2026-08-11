@@ -7,4 +7,4 @@ deploy/tls
 deploy/secrets
 *.pcap
 *.pcapng
-gonzb-connect-coordinator
+/gonzb-connect-coordinator

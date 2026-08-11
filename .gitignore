@@ -4,6 +4,6 @@ artifacts/
 coverage.out
 deploy/tls/
 deploy/secrets/
-gonzb-connect-coordinator
+/gonzb-connect-coordinator
 *.pcap
 *.pcapng
