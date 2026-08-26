@@ -35,7 +35,7 @@ const (
 	dataFrameBytes        = 16 << 10
 	maxInboundChannels    = 8
 	messageQueueDepth     = 16
-	maxRemoteCandidates   = 14
+	maxRemoteCandidates   = 32
 	maxSDPBytes           = 96 << 10
 	channelAdmissionWait  = 500 * time.Millisecond
 	// Pion retains closed DataChannel state for the lifetime of a
@@ -425,7 +425,7 @@ func validateRemoteSDP(payload string) error {
 			}
 			candidates[attribute.Value] = struct{}{}
 			if len(candidates) > maxRemoteCandidates {
-				return fmt.Errorf("remote SDP exceeds the ICE candidate limit")
+				return fmt.Errorf("remote SDP exceeds the ICE candidate limit (%d > %d)", len(candidates), maxRemoteCandidates)
 			}
 			fields := strings.Fields(attribute.Value)
 			if len(fields) < 8 || (fields[1] != "1" && fields[1] != "2") ||

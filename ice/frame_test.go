@@ -242,6 +242,18 @@ func TestValidateRemoteSDPEnforcesDataChannelSecurityProfile(t *testing.T) {
 	if err := validateRemoteSDP(sdp); err != nil {
 		t.Fatalf("valid Pion DataChannel SDP rejected: %v\n%s", err, sdp)
 	}
+	expanded := sdp
+	for index := 0; index < 16; index++ {
+		expanded += fmt.Sprintf(
+			"a=candidate:expanded%d %d udp 1 192.168.10.%d 9999 typ host\r\n",
+			index,
+			1+(index%2),
+			index+1,
+		)
+	}
+	if err := validateRemoteSDP(expanded); err != nil {
+		t.Fatalf("bounded multi-transport SDP rejected: %v", err)
+	}
 	tests := map[string]string{
 		"weak fingerprint":      strings.Replace(sdp, "fingerprint:sha-256", "fingerprint:sha-1", 1),
 		"second media":          sdp + "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
