@@ -5,7 +5,7 @@ go 1.25.12
 require (
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
 	github.com/gorilla/websocket v1.5.3
-	github.com/jackc/pgx/v5 v5.10.0
+	github.com/jackc/pgx/v5 v5.11.0
 	github.com/pion/sdp/v3 v3.0.19
 	github.com/pion/webrtc/v4 v4.2.18
 	golang.org/x/crypto v0.54.0
